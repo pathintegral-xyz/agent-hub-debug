@@ -1,7 +1,7 @@
 [project]
-name = "roto-debug"
+name = "agent-hub-debug"
 version = "0.1.0"
-description = "MCP server for RotoTV debugging and CLI operations"
+description = "MCP server for CloudWatch log querying"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -12,6 +12,10 @@ dependencies = [
     "fastmcp>=2.14.1",
 ]
 
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -20,4 +24,4 @@ where = ["src"]
 
 [project.scripts]
 # Run with: `uv run roto-debug`
-roto-debug = "mcp_server.server:main"
+agent-hub-debug = "mcp_server.server:main"
