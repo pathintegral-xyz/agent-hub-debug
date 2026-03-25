@@ -4,14 +4,11 @@ Agent Hub Debug MCP Server
 Provides CloudWatch log querying tools for the txyz backend.
 AWS credentials are read from environment variables.
 """
-import csv
 import json
 import logging
 import os
 import time
-import uuid
 from datetime import datetime, timedelta, timezone
-from io import StringIO
 from typing import Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -26,6 +23,10 @@ mcp = FastMCP(
     host="127.0.0.1", port="8081",
     # `host` and `port` will not work for stdio transport
 )
+
+# In-memory log store: query_id -> {env, query, entries, stored_at, count}
+_log_store: Dict[str, dict] = {}
+_query_counter = 0
 
 LOG_GROUPS: Dict[str, str] = {
     "stage": "/copilot/txyz-stage-anyon-api",
@@ -281,16 +282,6 @@ def _query_logs(
 
 
 @mcp.tool()
-def generate_uuid(count: int = 1) -> str:
-    """Generate UUID strings.
-
-    Args:
-        count: Number of UUIDs to generate (default: 1)
-    """
-    return "\n".join(str(uuid.uuid4()) for _ in range(max(count, 0)))
-
-
-@mcp.tool()
 def query_cloudwatch_logs(
     env: str,
     query: str,
@@ -300,7 +291,7 @@ def query_cloudwatch_logs(
     weeks: Optional[int] = None,
     chat_only: bool = True,
 ) -> str:
-    """Query CloudWatch Logs and return parsed results as CSV.
+    """Query CloudWatch Logs and store results in memory.
 
     AWS credentials must be set: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
     AWS_DEFAULT_REGION (and AWS_SESSION_TOKEN for temporary credentials).
@@ -312,11 +303,12 @@ def query_cloudwatch_logs(
         hours: Query logs from last N hours
         days: Query logs from last N days (default if no range given)
         weeks: Query logs from last N weeks
+        chat_only: If True (default), keep only chat_payload/stream_call/stream_response entries
 
     Returns:
-        CSV of parsed log fields: timestamp, level, message, session_id,
-        request_path, status_code, process_time_ms, exception
+        Summary string: query_id and how many results were stored
     """
+    global _query_counter
     entries = _query_logs(env, query, minutes=minutes, hours=hours, days=days, weeks=weeks, chat_only=chat_only)
 
     if not entries:
@@ -324,12 +316,170 @@ def query_cloudwatch_logs(
     if "error" in entries[0]:
         return f"Error: {entries[0]['error']}"
 
-    output = StringIO()
-    fields = list(entries[0].keys())
-    writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
-    writer.writeheader()
-    writer.writerows(entries)
-    return f"Found {len(entries)} results.\n\n{output.getvalue()}"
+    _query_counter += 1
+    qid = f"q{_query_counter}"
+    _log_store[qid] = {
+        "env": env,
+        "query": query,
+        "entries": entries,
+        "stored_at": datetime.now().isoformat(timespec="seconds"),
+        "count": len(entries),
+    }
+    return f"Stored {len(entries)} results as '{qid}'. Use list_queries or get_log_entries('{qid}') to inspect."
+
+
+@mcp.tool()
+def list_queries() -> str:
+    """List all stored query results in memory.
+
+    Returns a summary of each stored query: id, env, entry count, timestamp, and query string.
+    """
+    if not _log_store:
+        return "No queries stored. Run query_cloudwatch_logs first."
+    lines = []
+    for qid, meta in _log_store.items():
+        lines.append(f"{qid}  [{meta['env']}]  {meta['count']} entries  @ {meta['stored_at']}")
+        lines.append(f"    query: {meta['query'][:120]}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_log_entries(
+    query_id: str,
+    offset: int = 0,
+    limit: int = 20,
+    entry_type: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Read stored log entries with optional filtering and pagination.
+
+    Args:
+        query_id: ID returned by query_cloudwatch_logs (e.g. 'q1')
+        offset: Start index (default 0)
+        limit: Max entries to return (default 20)
+        entry_type: Filter by type — 'chat_payload', 'stream_call', or 'stream_response'
+        session_id: Filter by session UUID substring
+
+    Returns:
+        JSON array of matching entries (summary fields only — use get_entry_detail for full content)
+    """
+    if query_id not in _log_store:
+        return f"Unknown query_id '{query_id}'. Available: {list(_log_store.keys())}"
+
+    entries = _log_store[query_id]["entries"]
+
+    if entry_type:
+        entries = [e for e in entries if entry_type in e]
+    if session_id:
+        entries = [e for e in entries if session_id in e.get("session_id", "")]
+
+    page = entries[offset: offset + limit]
+    total = len(entries)
+
+    summary = []
+    for i, e in enumerate(page):
+        row: dict = {
+            "index": offset + i,
+            "timestamp": e.get("timestamp", ""),
+            "session_id": e.get("session_id", ""),
+            "context_id": e.get("context_id", ""),
+            "type": (
+                "chat_payload" if "chat_payload" in e
+                else "stream_call" if "stream_call" in e
+                else "stream_response" if "stream_response" in e
+                else "other"
+            ),
+        }
+        if "chat_payload" in e:
+            row["query"] = e["chat_payload"].get("query", "")
+        elif "stream_call" in e:
+            sc = e["stream_call"]
+            row["model"] = sc.get("model", "")
+            row["tool_names"] = sc.get("tool_names", [])
+            row["token_info"] = sc.get("token_info", {})
+        elif "stream_response" in e:
+            sr = e["stream_response"]
+            row["finish_reason"] = sr.get("response_metadata", {}).get("finish_reason", "")
+            row["usage"] = sr.get("usage_metadata", {})
+            row["tool_calls"] = [t.get("name") for t in sr.get("tool_calls", [])]
+            texts = [b["text"] for b in sr.get("content", []) if b.get("type") == "text"]
+            row["text_preview"] = texts[0][:200] if texts else ""
+        summary.append(row)
+
+    return json.dumps({"total": total, "offset": offset, "returned": len(page), "entries": summary}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_entry_detail(query_id: str, index: int) -> str:
+    """Get the full detail of a single log entry by index.
+
+    Args:
+        query_id: ID returned by query_cloudwatch_logs (e.g. 'q1')
+        index: Zero-based index of the entry (as shown in get_log_entries)
+
+    Returns:
+        Full JSON of the entry including all parsed fields
+    """
+    if query_id not in _log_store:
+        return f"Unknown query_id '{query_id}'. Available: {list(_log_store.keys())}"
+    entries = _log_store[query_id]["entries"]
+    if index < 0 or index >= len(entries):
+        return f"Index {index} out of range (0–{len(entries) - 1})"
+    return json.dumps(entries[index], ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_session_trace(query_id: str, session_id: str) -> str:
+    """Get all log entries for a specific session in chronological order.
+
+    Useful for tracing the full request/response cycle of one session.
+
+    Args:
+        query_id: ID returned by query_cloudwatch_logs (e.g. 'q1')
+        session_id: Session UUID (or substring) to filter by
+
+    Returns:
+        JSON with a timeline of chat_payload → stream_call → stream_response entries
+    """
+    if query_id not in _log_store:
+        return f"Unknown query_id '{query_id}'. Available: {list(_log_store.keys())}"
+
+    entries = _log_store[query_id]["entries"]
+    matched = [e for e in entries if session_id in e.get("session_id", "")]
+
+    if not matched:
+        return f"No entries found for session_id containing '{session_id}'"
+
+    trace = []
+    for e in matched:
+        step: dict = {
+            "timestamp": e.get("timestamp", ""),
+            "context_id": e.get("context_id", ""),
+        }
+        if "chat_payload" in e:
+            step["type"] = "chat_payload"
+            step["query"] = e["chat_payload"].get("query", "")
+            step["tools_available"] = [f["name"] for f in e["chat_payload"].get("client_tool", {}).get("functions", [])]
+        elif "stream_call" in e:
+            step["type"] = "stream_call"
+            sc = e["stream_call"]
+            step["model"] = sc.get("model", "")
+            step["token_info"] = sc.get("token_info", {})
+            step["tool_names"] = sc.get("tool_names", [])
+        elif "stream_response" in e:
+            step["type"] = "stream_response"
+            sr = e["stream_response"]
+            step["finish_reason"] = sr.get("response_metadata", {}).get("finish_reason", "")
+            step["usage"] = sr.get("usage_metadata", {})
+            step["tool_calls"] = [t.get("name") for t in sr.get("tool_calls", [])]
+            texts = [b["text"] for b in sr.get("content", []) if b.get("type") == "text"]
+            step["text"] = texts[0] if texts else ""
+            thinking = [b["thinking"] for b in sr.get("content", []) if b.get("type") == "thinking"]
+            if thinking:
+                step["thinking_preview"] = thinking[0][:300]
+        trace.append(step)
+
+    return json.dumps({"session_id": session_id, "steps": len(trace), "trace": trace}, ensure_ascii=False, indent=2)
 
 
 def main():
