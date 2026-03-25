@@ -57,87 +57,76 @@ def get_log_group(env: str) -> str:
 
 
 def _parse_chat_payload(message: str) -> dict:
-    """Parse 'Chat json payload: {...}' into structured fields."""
+    """Parse 'Chat json payload: {...}' via ast.literal_eval."""
     import ast
-    payload_str = message[len("Chat json payload: "):]
     try:
-        payload = ast.literal_eval(payload_str)
-        return {
-            "query": payload.get("query", ""),
-            "type": payload.get("type", ""),
-            "file_ids": payload.get("file_ids", []),
-            "client_functions": [
-                f["name"] for f in payload.get("client_tool", {}).get("functions", [])
-            ],
-        }
-    except Exception:
-        return {"parse_error": payload_str[:300]}
+        return ast.literal_eval(message[len("Chat json payload: "):])
+    except Exception as e:
+        return {"parse_error": str(e)}
 
 
 def _parse_stream_call(message: str) -> dict:
-    """Parse 'stream self.provider=X self.model=Y [...] tool_schemas=... token_info=...'"""
-    import ast
-    import re
-
+    """Parse 'stream self.provider=X self.model=Y [messages] ...kwargs'"""
+    import ast, re
     m = re.match(r"stream self\.provider=(\S+)\s+self\.model=(\S+)\s+(.*)", message, re.DOTALL)
     if not m:
         return {}
     provider, model, rest = m.groups()
     result: dict = {"provider": provider, "model": model}
 
-    # Extract trailing named scalar params via regex (simpler than full parse)
-    for key, pattern in [
-        ("temperature",     r"temperature=([\d.]+)"),
-        ("tool_choice",     r"tool_choice='([^']*)'"),
-        ("thinking_budget", r"self\.thinking_budget=(\S+)"),
-    ]:
-        km = re.search(pattern, rest)
-        if km:
-            result[key] = km.group(1)
+    # Split off the messages list from the trailing kwargs
+    msgs_str = re.split(r"\s+tool_schemas=", rest, maxsplit=1)[0]
+    try:
+        result["messages"] = ast.literal_eval(msgs_str)
+    except Exception:
+        result["messages_raw"] = msgs_str  # store as-is if truncated
 
-    # Extract token_info dict
+    # Trailing kwargs: token_info, temperature, tool_choice, tool_names
     ti = re.search(r"token_info=(\{[^}]+\})", rest)
     if ti:
         try:
             result["token_info"] = ast.literal_eval(ti.group(1))
         except Exception:
-            result["token_info_raw"] = ti.group(1)
+            pass
 
-    # Extract tool schema names
-    ts = re.search(r"tool_schemas=(\[.*?\]) tool_choice", rest, re.DOTALL)
+    for key, pat in [("temperature", r"temperature=([\d.]+)"), ("tool_choice", r"tool_choice='([^']*)'")]:
+        km = re.search(pat, rest)
+        if km:
+            result[key] = km.group(1)
+
+    ts = re.search(r"tool_schemas=(\[.*?\])\s+tool_choice", rest, re.DOTALL)
     if ts:
         try:
             schemas = ast.literal_eval(ts.group(1))
-            result["tool_names"] = [
-                s.get("function", {}).get("name") for s in schemas if "function" in s
-            ]
-        except Exception:
-            pass
-
-    # Try to parse the messages list (may be truncated in logs)
-    truncated = "...total" in rest
-    result["messages_truncated"] = truncated
-    if not truncated:
-        # Find the messages list (everything before ' tool_schemas=' or end)
-        msgs_str = re.split(r" tool_schemas=", rest, maxsplit=1)[0]
-        try:
-            messages = ast.literal_eval(msgs_str)
-            result["messages_count"] = len(messages)
-            result["message_roles"] = [m.get("type") for m in messages]
-            # Last human message text preview
-            for msg in reversed(messages):
-                if msg.get("type") == "human":
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-                        result["last_human_message"] = " ".join(texts)[:500]
-                    elif isinstance(content, str):
-                        result["last_human_message"] = content[:500]
-                    break
+            result["tool_names"] = [s.get("function", {}).get("name") for s in schemas if "function" in s]
         except Exception:
             pass
 
     return result
+
+
+def _parse_stream_response(message: str) -> dict:
+    """Parse 'stream response {...} token_info={...}' - a LangChain AI message dict."""
+    import ast, re
+    rest = message[len("stream response "):]
+
+    # Split off trailing token_info kwarg
+    ti_match = re.search(r"\s+token_info=(\{[^}]+\})$", rest)
+    token_info = None
+    if ti_match:
+        try:
+            token_info = ast.literal_eval(ti_match.group(1))
+        except Exception:
+            pass
+        rest = rest[:ti_match.start()]
+
+    try:
+        result = ast.literal_eval(rest)
+        if token_info:
+            result["token_info"] = token_info
+        return result
+    except Exception as e:
+        return {"parse_error": str(e)}
 
 
 def _parse_log_entry(raw_message, timestamp: str) -> dict:
@@ -167,6 +156,8 @@ def _parse_log_entry(raw_message, timestamp: str) -> dict:
             entry["chat_payload"] = _parse_chat_payload(message)
         elif message.startswith("stream self.provider="):
             entry["stream_call"] = _parse_stream_call(message)
+        elif message.startswith("stream response "):
+            entry["stream_response"] = _parse_stream_response(message)
 
         return entry
     except (json.JSONDecodeError, AttributeError):
@@ -272,6 +263,7 @@ def _query_logs(
                     e for e in parsed
                     if e.get("message", "").startswith("Chat json payload:")
                     or e.get("message", "").startswith("stream self.provider=")
+                    or e.get("message", "").startswith("stream response ")
                 ]
 
             if save:
