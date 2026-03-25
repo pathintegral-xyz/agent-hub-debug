@@ -138,3 +138,4 @@ get_session_trace("q1", "session-b-uuid")
 get_log_entries("q1", offset=0,  limit=20)
 get_log_entries("q1", offset=20, limit=20)
 ```
+Use canvas to visualize your results. 
