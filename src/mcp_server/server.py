@@ -155,10 +155,13 @@ def _parse_log_entry(raw_message, timestamp: str) -> dict:
 
         if message.startswith("Chat json payload:"):
             entry["chat_payload"] = _parse_chat_payload(message)
+            del entry["message"]
         elif message.startswith("stream self.provider="):
             entry["stream_call"] = _parse_stream_call(message)
+            del entry["message"]
         elif message.startswith("stream response "):
             entry["stream_response"] = _parse_stream_response(message)
+            del entry["message"]
 
         return entry
     except (json.JSONDecodeError, AttributeError):
